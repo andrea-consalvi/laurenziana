@@ -1,1 +1,1 @@
-# laurenziana
+Render: carica app.py, requirements.txt e render.yaml nella radice del repository GitHub. Su Render scegli New > Web Service, collega il repository e usa Build Command: pip install -r requirements.txt; Start Command: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 240 --workers 1 --threads 2.
