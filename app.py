@@ -39,7 +39,7 @@ IMAGE_HEADERS = {'User-Agent': 'LaurenzianaPDF/1.0 (scholarly image conversion)'
 def is_allowed_url(value: str) -> bool:
     try:
         u=urlparse(value)
-        return (u.scheme=='https' and u.hostname in {'tecabml.contentdm.oclc.org','cdm21069.contentdm.oclc.org'} and u.port in (None,443) and not u.username and not u.password)
+        return (u.scheme=='https' and u.hostname in {'tecabml.contentdm.oclc.org','cdm21059.contentdm.oclc.org'} and u.port in (None,443) and not u.username and not u.password)
     except ValueError:return False
 
 def secure_url(value: str) -> str:
@@ -58,15 +58,30 @@ def safe_get(url: str, *, timeout=(10,45), stream=False, headers=None):
     raise RuntimeError('Troppi reindirizzamenti.')
 
 def manuscript_id(raw: str) -> str:
-    if not is_allowed_url(raw):raise ValueError('Incolla un link HTTPS della Biblioteca Medicea Laurenziana.')
-    u=urlparse(raw)
-    m=re.search(r'/digital/collection/([A-Za-z0-9_-]+)/id/(\d+)',u.path)
-    if not m:raise ValueError('Link non riconosciuto: serve /digital/collection/NOME/id/NUMERO')
-    return m.group(1)+':'+m.group(2)
+    raw=raw.strip()
+    if not is_allowed_url(raw):
+        raise ValueError('Incolla un link HTTPS della Biblioteca Medicea Laurenziana.')
+    path=urlparse(raw).path
+    patterns=(
+        r'/digital/collection/([A-Za-z0-9_-]+)/id/(\d+)(?:/|$)',
+        r'/iiif/(?:2/)?([A-Za-z0-9_-]+):(\d+)/manifest\.json$',
+        r'/iiif/info/([A-Za-z0-9_-]+)/(\d+)/manifest\.json$',
+    )
+    for pattern in patterns:
+        m=re.search(pattern,path,re.I)
+        if m:
+            return m.group(1)+':'+m.group(2)
+    raise ValueError('Link non riconosciuto. Incolla il link del manoscritto dalla Teca digitale.')
+
 
 def fetch_manifest(mid: str):
     collection,item=mid.split(':',1)
-    urls=[f'https://tecabml.contentdm.oclc.org/iiif/2/{collection}:{item}/manifest.json',f'https://tecabml.contentdm.oclc.org/iiif/info/{collection}/{item}/manifest.json']
+    urls=[
+        f'https://cdm21059.contentdm.oclc.org/iiif/{collection}:{item}/manifest.json',
+        f'https://cdm21059.contentdm.oclc.org/iiif/2/{collection}:{item}/manifest.json',
+        f'https://tecabml.contentdm.oclc.org/iiif/info/{collection}/{item}/manifest.json',
+        f'https://tecabml.contentdm.oclc.org/iiif/2/{collection}:{item}/manifest.json',
+    ]
     errors=[]
     for url in urls:
         try:
