@@ -1,206 +1,368 @@
-import io, os, re, time, uuid, threading, tempfile
+"""Laurenziana PDF Downloader — single-instance web service."""
+from __future__ import annotations
+
+import concurrent.futures
+import os
+import re
+import shutil
+import tempfile
+import threading
+import time
+import uuid
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse, urlunparse
+
+import img2pdf
 import requests
-from PIL import Image, ImageOps
-from flask import Flask, request, jsonify, send_file, render_template_string
-app=Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"]=2*1024*1024
-S=requests.Session(); S.headers.update({'User-Agent':'Mozilla/5.0 (compatible; ManuscriptResearchDownloader/1.0)', 'Accept':'application/json,image/*;q=0.9,*/*;q=0.8'})
+from flask import Flask, jsonify, render_template, request, send_file
+from PIL import Image, ImageOps, UnidentifiedImageError
 
-def get(url):
-    r=S.get(url,timeout=50);r.raise_for_status();return r
+app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 4096
 
-def candidates(link):
-    u=urlparse(link.strip());
-    if u.scheme!='https' or u.hostname!='tecabml.contentdm.oclc.org': raise ValueError('Inserisci un indirizzo HTTPS della piattaforma tecabml.contentdm.oclc.org')
-    m=re.search(r'/digital/collection/([^/]+)/id/(\d+)',u.path)
-    if m:
-        a,i=m.groups();return [f'https://{u.hostname}/iiif/2/{a}:{i}/manifest.json',f'https://{u.hostname}/iiif/info/{a}/{i}/manifest.json']
-    if u.path.endswith('manifest.json'):return [link.strip()]
-    raise ValueError('Link non riconosciuto: serve /digital/collection/NOME/id/NUMERO')
+MAX_IMAGES = 1100
+MAX_IMAGE_BYTES = 22 * 1024 * 1024
+MAX_TOTAL_BYTES = 700 * 1024 * 1024
+MAX_AGE_SECONDS = 60 * 60
+MAX_DOWNLOADS = 1
+WORKERS = 4
+# Se la pagina non comunica più per 90 secondi, annulliamo il lavoro.
+CLIENT_LEASE_SECONDS = 90
 
-def manifest(link):
-    errors=[]
-    for url in candidates(link):
-        try:
-            j=get(url).json()
-            if j.get('sequences') or j.get('items'):return j,url
-            errors.append(f'{url}: nessuna sequenza di immagini')
-        except Exception as e:errors.append(f'{url}: {e}')
-    raise RuntimeError('Manifest non accessibile. '+' | '.join(errors))
-
-def text_label(x):
-    if isinstance(x,str):return x
-    if isinstance(x,dict):
-        if '@value' in x:return str(x['@value'])
-        return ' '.join(str(z) for vals in x.values() for z in (vals if isinstance(vals,list) else [vals]) if isinstance(z,str))
-    return ''
-
-def extract(j):
-    out=[]
-    if j.get('sequences'):
-        for c in j['sequences'][0].get('canvases',[]):
-            for ann in c.get('images',[]):
-                res=ann.get('resource',{});svc=res.get('service',{})
-                if isinstance(svc,list):svc=svc[0] if svc else {}
-                base=svc.get('@id') or svc.get('id') if isinstance(svc,dict) else None
-                direct=res.get('@id') or res.get('id')
-                if base or direct:out.append((text_label(c.get('label')) or str(len(out)+1),base,direct))
-    else:
-        for c in j.get('items',[]):
-            for annpage in c.get('items',[]):
-                for ann in annpage.get('items',[]):
-                    body=ann.get('body',{});body=body[0] if isinstance(body,list) else body
-                    svc=body.get('service',[]);svc=svc[0] if isinstance(svc,list) and svc else svc
-                    base=(svc.get('id') or svc.get('@id')) if isinstance(svc,dict) else None
-                    direct=body.get('id') or body.get('@id')
-                    if base or direct:out.append((text_label(c.get('label')) or str(len(out)+1),base,direct))
-    return out
-
-def download_image(base,direct,quality):
-    urls=[]
-    if base:
-        base=base.rstrip('/')
-        if quality=='Originale':sizes=['full','max','3000,','2000,']
-        elif quality=='Alta':sizes=['3000,','2000,','1500,']
-        elif quality=='Media':sizes=['1500,','1000,']
-        else:sizes=['800,','600,']
-        for size in sizes:
-            urls.extend([f'{base}/full/{size}/0/default.jpg',f'{base}/full/{size}/0/native.jpg'])
-    if direct:urls.append(direct)
-    error='';
-    for url in dict.fromkeys(urls):
-        try:
-            r=get(url)
-            im=Image.open(io.BytesIO(r.content));im.load()
-            im=ImageOps.exif_transpose(im)
-            if im.mode!='RGB':im=im.convert('RGB')
-            return im
-        except Exception as e:error=str(e)
-    raise RuntimeError(error or 'Immagine non disponibile')
+JOBS: dict[str, dict] = {}
+LOCK = threading.Lock()
+DEFAULT_URL = ''
+MANIFEST_HEADERS = {'User-Agent': 'LaurenzianaPDF/1.0 (scholarly image conversion)', 'Accept': 'application/json'}
+IMAGE_HEADERS = {'User-Agent': 'LaurenzianaPDF/1.0 (scholarly image conversion)', 'Accept': 'image/jpeg,image/*;q=0.9,*/*;q=0.5'}
 
 
-HTML=r"""<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Laurenziana · PDF Downloader</title>
-<style>
-:root{font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;color:#19352a;background:#f5f8f5}
-*{box-sizing:border-box}body{margin:0}.top{padding:19px max(24px,calc((100vw - 980px)/2));border-bottom:1px solid #dfe9e0;background:white;font-size:14px;font-weight:700;letter-spacing:.035em;color:#276749}
-main{max-width:850px;margin:0 auto;padding:75px 24px}.eyebrow{font-size:12px;font-weight:750;letter-spacing:.18em;text-transform:uppercase;color:#3a9062}
-h1{font-size:clamp(34px,5.5vw,56px);line-height:1.12;letter-spacing:-.045em;margin:16px 0 20px;color:#173d2a}
-.intro{font-size:17px;color:#5a7062;line-height:1.7;max-width:680px;margin-bottom:37px}.panel{background:white;border:1px solid #dce9df;box-shadow:0 15px 55px #173b2510;border-radius:17px;padding:32px}
-label{display:block;font-weight:680;margin-bottom:11px;font-size:14px}input,select{border:1px solid #cbdacf;border-radius:9px;background:#fff;padding:14px;font-size:15px;color:#244a34;width:100%}input:focus,select:focus{outline:2px solid #8fc8a5}
-.hint{font-size:13px;color:#7b8d80;margin:11px 0 25px;line-height:1.55}
-.actions{display:flex;align-items:end;gap:16px}.select{flex:1}.primary{background:#237a4b;color:white;border:0;border-radius:9px;padding:15px 23px;font-size:15px;font-weight:700;cursor:pointer;white-space:nowrap}.primary:hover{background:#155e38}.primary:disabled{opacity:.5;cursor:not-allowed}
-.secondary{background:white;border:1px solid #b5cdbb;color:#226642;border-radius:9px;padding:12px 19px;font-size:14px;font-weight:700;cursor:pointer}
-#progressArea{display:none;margin-top:25px;border-top:1px solid #e2ece5;padding-top:22px}.status{font-size:14px;margin:12px 0;color:#38694a}progress{width:100%;height:13px;accent-color:#26844f}
-a.file{display:none;color:#176a40;font-weight:700;margin-top:15px}.foot{font-size:13px;color:#7b8c80;line-height:1.7;margin-top:24px}
-@media(max-width:570px){main{padding:45px 16px}.panel{padding:22px}.actions{flex-direction:column;align-items:stretch}.select{width:100%}}
-</style></head><body><header class="top">LAURENZIANA · STRUMENTI DI RICERCA</header><main><div class="eyebrow">Manoscritti digitalizzati</div><h1>Dalla Laurenziana a un unico PDF.</h1><p class="intro">Incolla il link di un manoscritto, seleziona la qualità e scarica tutte le riproduzioni in ordine. Nessuna installazione necessaria.</p>
-<section class="panel"><label for="url">Indirizzo del manoscritto</label><input id="url" placeholder="https://tecabml.contentdm.oclc.org/digital/collection/plutei/id/146289/rec/1" value="https://tecabml.contentdm.oclc.org/digital/collection/plutei/id/146289/rec/1">
-<p class="hint">Accetta link alle schede dei manoscritti della Biblioteca Medicea Laurenziana sulla piattaforma CONTENTdm.</p>
-<div class="actions"><div class="select"><label for="quality">Qualità delle immagini</label><select id="quality"><option value="Originale">Originale</option><option value="Alta" selected>Alta</option><option value="Media">Media</option><option value="Bassa">Bassa</option></select></div><button class="primary" id="start" onclick="start()">Genera PDF →</button></div>
-<div id="progressArea"><div id="status" class="status">Preparazione...</div><progress id="bar" max="100" value="0"></progress><p><button class="secondary" id="stop" onclick="stop()">Annulla download</button></p><a class="file" id="file">↓ Scarica il PDF</a></div>
-</section><p class="foot">Puoi interrompere il lavoro con «Annulla download». Anche chiudendo la scheda, il server interromperà l'elaborazione dopo un breve periodo senza comunicazioni. Il PDF è temporaneo e viene eliminato automaticamente dopo circa un'ora. La disponibilità delle immagini dipende dal server della Laurenziana.</p></main>
-<script>
-let job=null,timer=null;
-async function start(){
-const btn=document.getElementById("start"),area=document.getElementById("progressArea"),status=document.getElementById("status");
-btn.disabled=true;area.style.display="block";document.getElementById("file").style.display="none";document.getElementById("stop").style.display="inline-block";status.textContent="Avvio del download...";
-try{let r=await fetch("/start",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({url:document.getElementById("url").value,quality:document.getElementById("quality").value})});let j=await r.json();if(!r.ok)throw Error(j.error);job=j.id;timer=setInterval(poll,1500);poll()}catch(e){status.textContent="Errore: "+e.message;btn.disabled=false}}
-async function poll(){if(!job)return;try{let r=await fetch("/status/"+job);let j=await r.json();if(!r.ok)throw Error(j.error);
-let p=j.total?Math.round(j.done/j.total*100):0;document.getElementById("bar").value=p;
-document.getElementById("status").textContent=j.status==="starting"?"Ricerca del manoscritto...":j.status==="download"?`Download immagini: ${j.done} / ${j.total} (${p}%)`:j.status==="pdf"?"Creazione del PDF...":j.status==="ready"?"PDF pronto.":j.status==="cancelled"?"Download annullato.":j.status==="error"?"Errore: "+j.error:"Preparazione...";
-if(["ready","error","cancelled"].includes(j.status)){clearInterval(timer);document.getElementById("start").disabled=false;document.getElementById("stop").style.display="none";if(j.status==="ready"){let a=document.getElementById("file");a.href="/file/"+job;a.style.display="inline-block";a.click()}job=null}
-}catch(e){document.getElementById("status").textContent="Connessione interrotta: "+e.message;clearInterval(timer);document.getElementById("start").disabled=false}}
-async function stop(){if(!job)return;clearInterval(timer);await fetch("/cancel/"+job,{method:"POST"});document.getElementById("status").textContent="Annullamento richiesto...";document.getElementById("start").disabled=false;document.getElementById("stop").style.display="none";job=null}
-</script></body></html>"""
-
-jobs={}
-lock=threading.Lock()
-TEMP=Path(tempfile.gettempdir())/"laurenziana_jobs"
-TEMP.mkdir(exist_ok=True)
-def worker(jid,url,quality):
-    job=jobs[jid]
+def is_allowed_url(value: str) -> bool:
     try:
-        j,_=manifest(url)
-        pages=extract(j)
-        if not pages:raise ValueError("Il manifest non contiene immagini.")
-        job.update(total=len(pages),status="download")
-        paths=[]
-        for idx,(_,base,direct) in enumerate(pages):
-            if job["cancel"].is_set():return
-            img=download_image(base,direct,quality)
-            p=TEMP/(jid+"_"+str(idx)+".jpg")
-            img.save(p,"JPEG",quality=88,optimize=True)
-            paths.append(p)
-            job["done"]=idx+1
-        if job["cancel"].is_set():return
-        job["status"]="pdf"
-        import img2pdf
-        target=TEMP/(jid+".pdf")
-        with open(target,"wb") as f:f.write(img2pdf.convert([str(p) for p in paths]))
-        if job["cancel"].is_set():return
-        job.update(status="ready",path=str(target),finished=time.time())
-    except Exception as e:
-        job.update(status="error",error=str(e),finished=time.time())
-    finally:
-        for p in TEMP.glob(jid+"_*.jpg"):
-            try:p.unlink()
-            except OSError:pass
-        if job["cancel"].is_set():
-            p=TEMP/(jid+".pdf")
-            p.unlink(missing_ok=True)
-            job["status"]="cancelled"
-            job["finished"]=time.time()
+        u=urlparse(value)
+        return (u.scheme=='https' and u.hostname in {'tecabml.contentdm.oclc.org','cdm21069.contentdm.oclc.org'} and u.port in (None,443) and not u.username and not u.password)
+    except ValueError:return False
 
-@app.get("/")
-def index():return render_template_string(HTML)
+def secure_url(value: str) -> str:
+    if not is_allowed_url(value):raise ValueError('Indirizzo immagine non autorizzato.')
+    return value
 
-@app.post("/start")
-def start():
-    data=request.get_json(silent=True) or {}
-    url=str(data.get("url",""))
-    quality=data.get("quality","Alta")
-    if quality not in ("Originale","Alta","Media","Bassa"):return jsonify(error="Qualità non valida"),400
-    try:candidates(url)
-    except Exception as e:return jsonify(error=str(e)),400
-    with lock:
-        active=sum(x["status"] in ("starting","download","pdf") for x in jobs.values())
-        if active>=2:return jsonify(error="Il server è occupato. Riprova tra poco."),429
-        jid=uuid.uuid4().hex
-        jobs[jid]={"status":"starting","done":0,"total":0,"cancel":threading.Event(),"last_seen":time.time(),"created":time.time()}
-    threading.Thread(target=worker,args=(jid,url,quality),daemon=True).start()
-    return jsonify(id=jid)
+def safe_get(url: str, *, timeout=(10,45), stream=False, headers=None):
+    current=secure_url(url)
+    for _ in range(5):
+        response=requests.get(current,headers=headers,timeout=timeout,stream=stream,allow_redirects=False)
+        if response.status_code in (301,302,303,307,308):
+            location=response.headers.get('Location');response.close()
+            if not location:raise RuntimeError('Reindirizzamento privo di URL')
+            current=secure_url(urljoin(current,location));continue
+        return response
+    raise RuntimeError('Troppi reindirizzamenti.')
 
-@app.get("/status/<jid>")
-def status(jid):
-    job=jobs.get(jid)
-    if not job:return jsonify(error="Download non trovato"),404
-    job["last_seen"]=time.time()
-    return jsonify(status=job["status"],done=job["done"],total=job["total"],error=job.get("error",""))
+def manuscript_id(raw: str) -> str:
+    if not is_allowed_url(raw):raise ValueError('Incolla un link HTTPS della Biblioteca Medicea Laurenziana.')
+    u=urlparse(raw)
+    m=re.search(r'/digital/collection/([A-Za-z0-9_-]+)/id/(\d+)',u.path)
+    if not m:raise ValueError('Link non riconosciuto: serve /digital/collection/NOME/id/NUMERO')
+    return m.group(1)+':'+m.group(2)
 
-@app.post("/cancel/<jid>")
-def cancel(jid):
-    job=jobs.get(jid)
-    if not job:return jsonify(error="Download non trovato"),404
-    job["cancel"].set()
-    return jsonify(ok=True)
+def fetch_manifest(mid: str):
+    collection,item=mid.split(':',1)
+    urls=[f'https://tecabml.contentdm.oclc.org/iiif/2/{collection}:{item}/manifest.json',f'https://tecabml.contentdm.oclc.org/iiif/info/{collection}/{item}/manifest.json']
+    errors=[]
+    for url in urls:
+        try:
+            with safe_get(url,timeout=(10,45),headers=MANIFEST_HEADERS) as r:
+                r.raise_for_status()
+                raw=r.content
+                if len(raw)>12_000_000:raise RuntimeError('Manifest troppo grande')
+                data=r.json()
+                if isinstance(data,dict) and (data.get('sequences') or data.get('items')):return data
+                errors.append('Manifest privo di sequenze')
+        except Exception as e:errors.append(str(e)[:120])
+    raise RuntimeError('Manifest IIIF non accessibile: '+' | '.join(errors))
 
-@app.get("/file/<jid>")
-def file(jid):
-    job=jobs.get(jid)
-    if not job or job["status"]!="ready":return jsonify(error="PDF non pronto"),404
-    return send_file(job["path"],as_attachment=True,download_name="laurenziana_"+jid[:8]+".pdf",mimetype="application/pdf")
+def service_and_direct(body):
+    if isinstance(body, list):
+        body = next((x for x in body if isinstance(x, dict)), {})
+    if not isinstance(body, dict):
+        return None
+    services = body.get('service') or []
+    if isinstance(services, dict):
+        services = [services]
+    for service in services:
+        if isinstance(service, dict):
+            base = service.get('id') or service.get('@id')
+            if base and is_allowed_url(base):
+                return ('iiif', secure_url(base).rstrip('/'))
+    direct = body.get('id') or body.get('@id')
+    if direct and is_allowed_url(direct):
+        return ('direct', secure_url(direct))
+    return None
+
+
+def images_from_manifest(manifest):
+    images = []
+    # IIIF Presentation 2: first sequence is the physical canvas order
+    sequences = manifest.get('sequences') or []
+    if sequences:
+        for canvas in sequences[0].get('canvases', []):
+            for annotation in canvas.get('images', []):
+                item = service_and_direct(annotation.get('resource'))
+                if item:
+                    images.append(item)
+                    break
+    # IIIF Presentation 3
+    else:
+        for canvas in manifest.get('items', []):
+            found = False
+            for page in canvas.get('items', []):
+                for annotation in page.get('items', []):
+                    if annotation.get('motivation') not in (None, 'painting', ['painting']):
+                        continue
+                    item = service_and_direct(annotation.get('body'))
+                    if item:
+                        images.append(item)
+                        found = True
+                        break
+                if found:
+                    break
+    if not images:
+        raise RuntimeError('Il manifest non contiene immagini IIIF compatibili o indica immagini su un server non ammesso.')
+    if len(images) > MAX_IMAGES:
+        raise RuntimeError(f'Il manoscritto contiene {len(images)} immagini, oltre il limite di sicurezza ({MAX_IMAGES}).')
+    return images
+
+
+def image_candidates(image, quality):
+    kind, source = image
+    if kind == 'direct':
+        return [source]
+    if quality == 'full':
+        sizes = ('full', 'max')
+    else:
+        # IIIF v2 square bounding box; width-only alternative for older Loris installations
+        sizes = (f'!{quality},{quality}', f'{quality},', f'w{quality},')
+    return [f'{source}/full/{size}/0/default.jpg' for size in sizes]
+
+
+class JobCancelled(Exception):
+    """A job was explicitly cancelled or its browser tab stopped checking in."""
+
+
+def ensure_active(job_id: str):
+    with LOCK:
+        job = JOBS.get(job_id)
+        if not job or job['cancel_event'].is_set() or job['status'] == 'cancelled':
+            raise JobCancelled('Download annullato.')
+        if (job['status'] == 'running'
+                and time.monotonic() - job['last_seen'] > CLIENT_LEASE_SECONDS):
+            job['cancel_event'].set()
+            job['status'] = 'cancelled'
+            job['message'] = 'Download interrotto: la pagina non è più collegata.'
+            raise JobCancelled(job['message'])
+
+
+def download_one(index: int, image, quality: str, folder: Path, job_id: str):
+    """Stream a single image with periodic cooperative cancellation checks."""
+    last_error = None
+    for url in image_candidates(image, quality):
+        for attempt in range(2):
+            ensure_active(job_id)
+            tmp = folder / f'{index:05}.part'
+            try:
+                with safe_get(url, timeout=(12, 40), stream=True, headers=IMAGE_HEADERS) as r:
+                    r.raise_for_status()
+                    if int(r.headers.get('content-length', 0)) > MAX_IMAGE_BYTES:
+                        raise RuntimeError('Immagine oltre il limite di 22 MB.')
+                    received = 0
+                    with tmp.open('wb') as stream:
+                        for chunk in r.iter_content(chunk_size=131072):
+                            ensure_active(job_id)
+                            if not chunk:
+                                continue
+                            received += len(chunk)
+                            if received > MAX_IMAGE_BYTES:
+                                raise RuntimeError('Immagine oltre il limite di 22 MB.')
+                            stream.write(chunk)
+                ensure_active(job_id)
+                with Image.open(tmp) as im:
+                    im.verify()
+                with Image.open(tmp) as im:
+                    if im.format == 'JPEG' and im.mode in ('RGB', 'L'):
+                        target = folder / f'{index:05}.jpg'
+                        tmp.replace(target)
+                        return target, target.stat().st_size
+                    target = folder / f'{index:05}.jpg'
+                    ImageOps.exif_transpose(im).convert('RGB').save(target, 'JPEG', quality=88)
+                tmp.unlink(missing_ok=True)
+                return target, target.stat().st_size
+            except JobCancelled:
+                tmp.unlink(missing_ok=True)
+                raise
+            except (requests.RequestException, RuntimeError, OSError, UnidentifiedImageError, ValueError) as exc:
+                tmp.unlink(missing_ok=True)
+                last_error = exc
+                if attempt == 0:
+                    ensure_active(job_id)
+                    time.sleep(0.7)
+    ensure_active(job_id)
+    raise RuntimeError(f'Errore durante il download della pagina {index + 1}: {last_error}')
+
+
+def update(job_id: str, **changes):
+    with LOCK:
+        if job_id in JOBS:
+            JOBS[job_id].update(changes)
+
+
+def run_job(job_id: str, mid: str, quality: str):
+    folder = None
+    futures = {}
+    try:
+        ensure_active(job_id)
+        update(job_id, message='Lettura del manifest IIIF…')
+        manifest = fetch_manifest(mid)
+        ensure_active(job_id)
+        images = images_from_manifest(manifest)
+        folder = Path(tempfile.mkdtemp(prefix='laurenziana_pdf_'))
+        update(job_id, total=len(images), message=f'{len(images)} immagini individuate. Scaricamento avviato…')
+        paths = [None] * len(images)
+        total_bytes = 0
+        completed = 0
+        # Wait in short intervals to detect closed tabs also when the image server is slow.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as pool:
+            futures = {pool.submit(download_one, i, item, quality, folder, job_id): i
+                       for i, item in enumerate(images)}
+            pending = set(futures)
+            try:
+                while pending:
+                    ensure_active(job_id)
+                    finished, pending = concurrent.futures.wait(
+                        pending, timeout=1.0, return_when=concurrent.futures.FIRST_COMPLETED)
+                    for future in finished:
+                        ensure_active(job_id)
+                        path, nbytes = future.result()
+                        paths[futures[future]] = path
+                        total_bytes += nbytes
+                        completed += 1
+                        if total_bytes > MAX_TOTAL_BYTES:
+                            raise RuntimeError('Limite di spazio raggiunto (700 MB). Prova la qualità Veloce.')
+                        update(job_id, percent=int(completed / len(images) * 92),
+                               message=f'Immagini scaricate: {completed}/{len(images)}')
+            except Exception:
+                for future in futures:
+                    future.cancel()
+                # Cancellation is propagated to active workers; the executor waits for
+                # them to stop before the temporary folder can safely be removed.
+                raise
+        ensure_active(job_id)
+        update(job_id, percent=94, message='Assemblaggio del PDF senza ricompressione…')
+        output_path = folder / f'{mid}.pdf'
+        with output_path.open('wb') as output:
+            img2pdf.convert([str(p) for p in paths], outputstream=output)
+        ensure_active(job_id)
+        for image_path in paths:
+            image_path.unlink(missing_ok=True)
+        update(job_id, status='done', percent=100,
+               message=f'PDF pronto: {len(paths)} immagini, {output_path.stat().st_size / (1024 ** 2):.1f} MB.',
+               path=str(output_path), filename=output_path.name)
+    except JobCancelled:
+        update(job_id, status='cancelled', message='Download annullato.', percent=0)
+        if folder:
+            shutil.rmtree(folder, ignore_errors=True)
+    except Exception as exc:
+        with LOCK:
+            cancelled = job_id in JOBS and JOBS[job_id]['cancel_event'].is_set()
+        if cancelled:
+            update(job_id, status='cancelled', message='Download annullato.', percent=0)
+        else:
+            update(job_id, status='error', message=str(exc), percent=0)
+        if folder:
+            shutil.rmtree(folder, ignore_errors=True)
+
 
 def cleanup():
-    while True:
-        time.sleep(30)
-        now=time.time()
-        for jid,job in list(jobs.items()):
-            if job["status"] in ("starting","download","pdf") and now-job["last_seen"]>100:
-                job["cancel"].set()
-            if job["status"] in ("ready","error","cancelled") and now-job.get("finished",now)>3600:
-                (TEMP/(jid+".pdf")).unlink(missing_ok=True)
-                jobs.pop(jid,None)
-threading.Thread(target=cleanup,daemon=True).start()
-if __name__=="__main__":app.run(host="0.0.0.0",port=int(os.getenv("PORT","10000")))
+    now = time.time()
+    with LOCK:
+        expired = [job_id for job_id, job in JOBS.items()
+                   if job['status'] != 'running' and now - job['created_at'] > MAX_AGE_SECONDS]
+        deleted = [JOBS.pop(job_id) for job_id in expired]
+    for job in deleted:
+        if job.get('path'):
+            shutil.rmtree(Path(job['path']).parent, ignore_errors=True)
+
+
+@app.get('/')
+def index():
+    return render_template('index.html', example=DEFAULT_URL)
+
+
+@app.get('/health')
+def health():
+    return jsonify(status='ok')
+
+
+@app.post('/api/jobs')
+def create_job():
+    cleanup()
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify(error='Richiesta non valida.'), 400
+    try:
+        mid = manuscript_id(str(data.get('url', '')).strip())
+        quality = str(data.get('quality', '2000'))
+        if quality not in ('1200', '2000', '3000', 'full'):
+            raise ValueError('Risoluzione non valida.')
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+    with LOCK:
+        if sum(j['status'] == 'running' for j in JOBS.values()) >= MAX_DOWNLOADS:
+            return jsonify(error='È già in corso un download. Riprova quando sarà terminato.'), 429
+        job_id = uuid.uuid4().hex
+        JOBS[job_id] = {'status': 'running', 'message': 'Preparazione…', 'percent': 0,
+                        'created_at': time.time(), 'last_seen': time.monotonic(),
+                        'cancel_event': threading.Event(), 'total': 0}
+    threading.Thread(target=run_job, args=(job_id, mid, quality), daemon=True).start()
+    return jsonify(id=job_id), 202
+
+
+@app.get('/api/jobs/<job_id>')
+def status(job_id):
+    with LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            return jsonify(error='Operazione non trovata o scaduta.'), 404
+        if job['status'] == 'running':
+            job['last_seen'] = time.monotonic()
+        return jsonify({key: value for key, value in job.items()
+                        if key not in ('path', 'filename', 'created_at', 'last_seen', 'cancel_event')})
+
+
+@app.post('/api/jobs/<job_id>/cancel')
+def cancel_job(job_id):
+    """Mark cancellation immediately; workers stop cooperatively and clean files."""
+    with LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            return jsonify(error='Operazione non trovata.'), 404
+        if job['status'] == 'running':
+            job['cancel_event'].set()
+            job['status'] = 'cancelled'
+            job['message'] = 'Download annullato.'
+            job['percent'] = 0
+        return jsonify(status=job['status'])
+
+
+@app.get('/api/jobs/<job_id>/download')
+def download(job_id):
+    with LOCK:
+        job = JOBS.get(job_id)
+        if not job or job['status'] != 'done':
+            return jsonify(error='Il PDF non è pronto o è scaduto.'), 404
+        path, filename = job['path'], job['filename']
+    if not Path(path).is_file():
+        return jsonify(error='Il file non è più disponibile: ripeti il download.'), 410
+    return send_file(path, mimetype='application/pdf', as_attachment=True, download_name=filename)
+
+
+if __name__ == '__main__':
+    app.run(host='127.0.0.1', port=int(os.environ.get('PORT', '5000')), debug=False)
