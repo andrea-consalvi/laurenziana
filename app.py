@@ -1,10 +1,11 @@
-import io, json, re, tempfile, os
+import io, os, re, time, uuid, threading, tempfile
+from pathlib import Path
 from urllib.parse import urlparse
 import requests
 from PIL import Image, ImageOps
-from flask import Flask, request, render_template_string, send_file, jsonify
+from flask import Flask, request, jsonify, send_file, render_template_string
 app=Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"]=12*1024*1024
+app.config["MAX_CONTENT_LENGTH"]=2*1024*1024
 S=requests.Session(); S.headers.update({'User-Agent':'Mozilla/5.0 (compatible; ManuscriptResearchDownloader/1.0)', 'Accept':'application/json,image/*;q=0.9,*/*;q=0.8'})
 
 def get(url):
@@ -80,43 +81,126 @@ def download_image(base,direct,quality):
     raise RuntimeError(error or 'Immagine non disponibile')
 
 
-HTML="""<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Laurenziana PDF Downloader</title><style>
-*{box-sizing:border-box}body{margin:0;background:#f7faf7;color:#22372a;font:16px system-ui,-apple-system,sans-serif}.wrap{max-width:730px;margin:45px auto;padding:0 18px}h1{text-align:center;color:#216b46;font-size:30px;margin:0 0 8px}.subtitle{text-align:center;color:#64786b;margin:0 0 32px}.card{background:white;border:1px solid #dce8df;border-radius:13px;padding:25px;box-shadow:0 3px 16px #173b2510}label{display:block;font-weight:600;margin:18px 0 7px}input,select{width:100%;padding:12px;border:1px solid #b9cfc0;border-radius:8px;font:inherit;background:white}button,.download{display:block;text-align:center;width:100%;padding:13px 16px;border:0;border-radius:8px;background:#267a50;color:white;font:600 16px system-ui;cursor:pointer;text-decoration:none;margin-top:14px}button:hover,.download:hover{background:#175d3a}.secondary{background:#e7f3eb;color:#1b6942}.secondary:hover{background:#d6e9dd}.sep{border-top:1px solid #e2ebe5;margin:25px 0}.row{display:grid;grid-template-columns:1fr 1fr;gap:14px}.note{color:#6a7e70;font-size:13px}.status{font-size:14px;color:#286b46;white-space:pre-wrap;margin-top:10px}.error{color:#a33434}h2{font-size:18px;color:#205d3c;margin:0 0 10px}
-</style></head><body><main class="wrap"><h1>Laurenziana PDF Downloader</h1><p class="subtitle">Scarica i manoscritti della Biblioteca Medicea Laurenziana in PDF</p><div class="card"><h2>Manoscritto</h2><label for="url">Link del manoscritto</label><input id="url" value="https://tecabml.contentdm.oclc.org/digital/collection/plutei/id/146289/rec/1"><button onclick="fetchManifest()">Genera manifest JSON</button><div id="msg" class="status"></div><a id="jsonDownload" class="download secondary" style="display:none">Scarica manifest JSON</a><div class="sep"></div><h2>Oppure carica un manifest JSON</h2><input id="file" type="file" accept=".json,application/json"><div class="sep"></div><h2>Genera PDF</h2><p id="count" class="note">Genera o carica un manifest per iniziare.</p><label for="quality">Qualità delle immagini</label><select id="quality"><option>Originale</option><option selected>Alta</option><option>Media</option><option>Bassa</option></select><div class="row"><div><label for="start">Da pagina</label><input id="start" type="number" min="1" value="1"></div><div><label for="end">A pagina</label><input id="end" type="number" min="1" value="1"></div></div><button onclick="makePdf()">Scarica PDF</button><div id="pdfmsg" class="status"></div><p class="note">Per manoscritti molto grandi potrebbe essere necessario scaricare più intervalli.</p></div></main><script>
-let manifestData=null;
-function setManifest(m){manifestData=m;let n=pageCount(m);document.getElementById('count').textContent='Pagine disponibili: '+n;document.getElementById('end').value=n;document.getElementById('end').max=n;document.getElementById('start').max=n;let blob=new Blob([JSON.stringify(m,null,2)],{type:'application/json'});let a=document.getElementById('jsonDownload');if(a.dataset.url)URL.revokeObjectURL(a.dataset.url);a.dataset.url=URL.createObjectURL(blob);a.href=a.dataset.url;a.download='laurenziana_manifest.json';a.style.display='block'}
-function pageCount(m){if(m.sequences)return (m.sequences[0].canvases||[]).length;return (m.items||[]).length}
-async function fetchManifest(){let e=document.getElementById('msg');e.textContent='Recupero manifest...';try{let r=await fetch('/manifest',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:document.getElementById('url').value})});let j=await r.json();if(!r.ok)throw Error(j.error);setManifest(j.manifest);e.textContent='Manifest pronto.'}catch(err){e.textContent='Errore: '+err.message}}
-document.getElementById('file').addEventListener('change',async e=>{try{let m=JSON.parse(await e.target.files[0].text());setManifest(m);document.getElementById('msg').textContent='Manifest caricato.'}catch(err){document.getElementById('msg').textContent='JSON non valido: '+err.message}});
-async function makePdf(){let msg=document.getElementById('pdfmsg');if(!manifestData){msg.textContent='Prima genera o carica un manifest.';return}msg.textContent='Generazione PDF in corso...';try{let r=await fetch('/pdf',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({manifest:manifestData,quality:document.getElementById('quality').value,start:Number(document.getElementById('start').value),end:Number(document.getElementById('end').value)})});if(!r.ok){let j=await r.json();throw Error(j.error)}let blob=await r.blob();let url=URL.createObjectURL(blob);let a=document.createElement('a');a.href=url;a.download='laurenziana_'+document.getElementById('start').value+'-'+document.getElementById('end').value+'.pdf';a.click();setTimeout(()=>URL.revokeObjectURL(url),60000);msg.textContent='Download avviato.'}catch(err){msg.textContent='Errore: '+err.message}}
+HTML=r"""<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Laurenziana · PDF Downloader</title>
+<style>
+:root{font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;color:#19352a;background:#f5f8f5}
+*{box-sizing:border-box}body{margin:0}.top{padding:19px max(24px,calc((100vw - 980px)/2));border-bottom:1px solid #dfe9e0;background:white;font-size:14px;font-weight:700;letter-spacing:.035em;color:#276749}
+main{max-width:850px;margin:0 auto;padding:75px 24px}.eyebrow{font-size:12px;font-weight:750;letter-spacing:.18em;text-transform:uppercase;color:#3a9062}
+h1{font-size:clamp(34px,5.5vw,56px);line-height:1.12;letter-spacing:-.045em;margin:16px 0 20px;color:#173d2a}
+.intro{font-size:17px;color:#5a7062;line-height:1.7;max-width:680px;margin-bottom:37px}.panel{background:white;border:1px solid #dce9df;box-shadow:0 15px 55px #173b2510;border-radius:17px;padding:32px}
+label{display:block;font-weight:680;margin-bottom:11px;font-size:14px}input,select{border:1px solid #cbdacf;border-radius:9px;background:#fff;padding:14px;font-size:15px;color:#244a34;width:100%}input:focus,select:focus{outline:2px solid #8fc8a5}
+.hint{font-size:13px;color:#7b8d80;margin:11px 0 25px;line-height:1.55}
+.actions{display:flex;align-items:end;gap:16px}.select{flex:1}.primary{background:#237a4b;color:white;border:0;border-radius:9px;padding:15px 23px;font-size:15px;font-weight:700;cursor:pointer;white-space:nowrap}.primary:hover{background:#155e38}.primary:disabled{opacity:.5;cursor:not-allowed}
+.secondary{background:white;border:1px solid #b5cdbb;color:#226642;border-radius:9px;padding:12px 19px;font-size:14px;font-weight:700;cursor:pointer}
+#progressArea{display:none;margin-top:25px;border-top:1px solid #e2ece5;padding-top:22px}.status{font-size:14px;margin:12px 0;color:#38694a}progress{width:100%;height:13px;accent-color:#26844f}
+a.file{display:none;color:#176a40;font-weight:700;margin-top:15px}.foot{font-size:13px;color:#7b8c80;line-height:1.7;margin-top:24px}
+@media(max-width:570px){main{padding:45px 16px}.panel{padding:22px}.actions{flex-direction:column;align-items:stretch}.select{width:100%}}
+</style></head><body><header class="top">LAURENZIANA · STRUMENTI DI RICERCA</header><main><div class="eyebrow">Manoscritti digitalizzati</div><h1>Dalla Laurenziana a un unico PDF.</h1><p class="intro">Incolla il link di un manoscritto, seleziona la qualità e scarica tutte le riproduzioni in ordine. Nessuna installazione necessaria.</p>
+<section class="panel"><label for="url">Indirizzo del manoscritto</label><input id="url" placeholder="https://tecabml.contentdm.oclc.org/digital/collection/plutei/id/146289/rec/1" value="https://tecabml.contentdm.oclc.org/digital/collection/plutei/id/146289/rec/1">
+<p class="hint">Accetta link alle schede dei manoscritti della Biblioteca Medicea Laurenziana sulla piattaforma CONTENTdm.</p>
+<div class="actions"><div class="select"><label for="quality">Qualità delle immagini</label><select id="quality"><option value="Originale">Originale</option><option value="Alta" selected>Alta</option><option value="Media">Media</option><option value="Bassa">Bassa</option></select></div><button class="primary" id="start" onclick="start()">Genera PDF →</button></div>
+<div id="progressArea"><div id="status" class="status">Preparazione...</div><progress id="bar" max="100" value="0"></progress><p><button class="secondary" id="stop" onclick="stop()">Annulla download</button></p><a class="file" id="file">↓ Scarica il PDF</a></div>
+</section><p class="foot">Puoi interrompere il lavoro con «Annulla download». Anche chiudendo la scheda, il server interromperà l'elaborazione dopo un breve periodo senza comunicazioni. Il PDF è temporaneo e viene eliminato automaticamente dopo circa un'ora. La disponibilità delle immagini dipende dal server della Laurenziana.</p></main>
+<script>
+let job=null,timer=null;
+async function start(){
+const btn=document.getElementById("start"),area=document.getElementById("progressArea"),status=document.getElementById("status");
+btn.disabled=true;area.style.display="block";document.getElementById("file").style.display="none";document.getElementById("stop").style.display="inline-block";status.textContent="Avvio del download...";
+try{let r=await fetch("/start",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({url:document.getElementById("url").value,quality:document.getElementById("quality").value})});let j=await r.json();if(!r.ok)throw Error(j.error);job=j.id;timer=setInterval(poll,1500);poll()}catch(e){status.textContent="Errore: "+e.message;btn.disabled=false}}
+async function poll(){if(!job)return;try{let r=await fetch("/status/"+job);let j=await r.json();if(!r.ok)throw Error(j.error);
+let p=j.total?Math.round(j.done/j.total*100):0;document.getElementById("bar").value=p;
+document.getElementById("status").textContent=j.status==="starting"?"Ricerca del manoscritto...":j.status==="download"?`Download immagini: ${j.done} / ${j.total} (${p}%)`:j.status==="pdf"?"Creazione del PDF...":j.status==="ready"?"PDF pronto.":j.status==="cancelled"?"Download annullato.":j.status==="error"?"Errore: "+j.error:"Preparazione...";
+if(["ready","error","cancelled"].includes(j.status)){clearInterval(timer);document.getElementById("start").disabled=false;document.getElementById("stop").style.display="none";if(j.status==="ready"){let a=document.getElementById("file");a.href="/file/"+job;a.style.display="inline-block";a.click()}job=null}
+}catch(e){document.getElementById("status").textContent="Connessione interrotta: "+e.message;clearInterval(timer);document.getElementById("start").disabled=false}}
+async function stop(){if(!job)return;clearInterval(timer);await fetch("/cancel/"+job,{method:"POST"});document.getElementById("status").textContent="Annullamento richiesto...";document.getElementById("start").disabled=false;document.getElementById("stop").style.display="none";job=null}
 </script></body></html>"""
+
+jobs={}
+lock=threading.Lock()
+TEMP=Path(tempfile.gettempdir())/"laurenziana_jobs"
+TEMP.mkdir(exist_ok=True)
+def worker(jid,url,quality):
+    job=jobs[jid]
+    try:
+        j,_=manifest(url)
+        pages=extract(j)
+        if not pages:raise ValueError("Il manifest non contiene immagini.")
+        job.update(total=len(pages),status="download")
+        paths=[]
+        for idx,(_,base,direct) in enumerate(pages):
+            if job["cancel"].is_set():return
+            img=download_image(base,direct,quality)
+            p=TEMP/(jid+"_"+str(idx)+".jpg")
+            img.save(p,"JPEG",quality=88,optimize=True)
+            paths.append(p)
+            job["done"]=idx+1
+        if job["cancel"].is_set():return
+        job["status"]="pdf"
+        import img2pdf
+        target=TEMP/(jid+".pdf")
+        with open(target,"wb") as f:f.write(img2pdf.convert([str(p) for p in paths]))
+        if job["cancel"].is_set():return
+        job.update(status="ready",path=str(target),finished=time.time())
+    except Exception as e:
+        job.update(status="error",error=str(e),finished=time.time())
+    finally:
+        for p in TEMP.glob(jid+"_*.jpg"):
+            try:p.unlink()
+            except OSError:pass
+        if job["cancel"].is_set():
+            p=TEMP/(jid+".pdf")
+            p.unlink(missing_ok=True)
+            job["status"]="cancelled"
+            job["finished"]=time.time()
+
 @app.get("/")
-def index(): return render_template_string(HTML)
-@app.post("/manifest")
-def manifest_route():
-    try:
-        j,url=manifest((request.get_json() or {}).get("url",""))
-        return jsonify(manifest=j,url=url)
+def index():return render_template_string(HTML)
+
+@app.post("/start")
+def start():
+    data=request.get_json(silent=True) or {}
+    url=str(data.get("url",""))
+    quality=data.get("quality","Alta")
+    if quality not in ("Originale","Alta","Media","Bassa"):return jsonify(error="Qualità non valida"),400
+    try:candidates(url)
     except Exception as e:return jsonify(error=str(e)),400
-@app.post("/pdf")
-def pdf_route():
-    try:
-        args=request.get_json()
-        pages=extract(args["manifest"])
-        start=int(args["start"]);end=int(args["end"])
-        if not 1<=start<=end<=len(pages):raise ValueError("Intervallo pagine non valido")
-        if end-start+1>150:raise ValueError("Seleziona al massimo 150 pagine per PDF per evitare limiti di memoria")
-        quality=args.get("quality","Alta")
-        if quality not in ("Originale","Alta","Media","Bassa"):raise ValueError("Qualità non valida")
-        imgs=[];errors=[]
-        for idx,(label,base,direct) in enumerate(pages[start-1:end],start):
-            try:imgs.append(download_image(base,direct,quality))
-            except Exception as e:errors.append(f"{idx} ({label}): {e}")
-        if errors:raise RuntimeError("Immagini non disponibili: "+"; ".join(errors[:4]) + (f" (e altre {len(errors)-4})" if len(errors)>4 else ""))
-        if not imgs:raise ValueError("Nessuna immagine trovata")
-        output=io.BytesIO()
-        imgs[0].save(output,format="PDF",save_all=True,append_images=imgs[1:],resolution=150)
-        output.seek(0)
-        return send_file(output,mimetype="application/pdf",as_attachment=True,download_name=f"laurenziana_{start}-{end}.pdf")
-    except Exception as e:return jsonify(error=str(e)),400
-if __name__=="__main__":app.run(host="0.0.0.0",port=int(os.environ.get("PORT",10000)))
+    with lock:
+        active=sum(x["status"] in ("starting","download","pdf") for x in jobs.values())
+        if active>=2:return jsonify(error="Il server è occupato. Riprova tra poco."),429
+        jid=uuid.uuid4().hex
+        jobs[jid]={"status":"starting","done":0,"total":0,"cancel":threading.Event(),"last_seen":time.time(),"created":time.time()}
+    threading.Thread(target=worker,args=(jid,url,quality),daemon=True).start()
+    return jsonify(id=jid)
+
+@app.get("/status/<jid>")
+def status(jid):
+    job=jobs.get(jid)
+    if not job:return jsonify(error="Download non trovato"),404
+    job["last_seen"]=time.time()
+    return jsonify(status=job["status"],done=job["done"],total=job["total"],error=job.get("error",""))
+
+@app.post("/cancel/<jid>")
+def cancel(jid):
+    job=jobs.get(jid)
+    if not job:return jsonify(error="Download non trovato"),404
+    job["cancel"].set()
+    return jsonify(ok=True)
+
+@app.get("/file/<jid>")
+def file(jid):
+    job=jobs.get(jid)
+    if not job or job["status"]!="ready":return jsonify(error="PDF non pronto"),404
+    return send_file(job["path"],as_attachment=True,download_name="laurenziana_"+jid[:8]+".pdf",mimetype="application/pdf")
+
+def cleanup():
+    while True:
+        time.sleep(30)
+        now=time.time()
+        for jid,job in list(jobs.items()):
+            if job["status"] in ("starting","download","pdf") and now-job["last_seen"]>100:
+                job["cancel"].set()
+            if job["status"] in ("ready","error","cancelled") and now-job.get("finished",now)>3600:
+                (TEMP/(jid+".pdf")).unlink(missing_ok=True)
+                jobs.pop(jid,None)
+threading.Thread(target=cleanup,daemon=True).start()
+if __name__=="__main__":app.run(host="0.0.0.0",port=int(os.getenv("PORT","10000")))

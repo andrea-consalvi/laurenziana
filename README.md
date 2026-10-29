@@ -1,1 +1,3 @@
-Render: carica app.py, requirements.txt e render.yaml nella radice del repository GitHub. Su Render scegli New > Web Service, collega il repository e usa Build Command: pip install -r requirements.txt; Start Command: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 240 --workers 1 --threads 2.
+Laurenziana PDF Downloader — Flask + Render Blueprint.
+Carica i file nella radice del repository GitHub e distribuisci tramite New > Blueprint su Render.
+L’applicazione usa un processo in memoria per il download; un riavvio di Render interrompe i download in corso. Il supporto del server IIIF deve essere verificato su manoscritti reali.
